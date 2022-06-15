@@ -70,10 +70,11 @@ type CloudWatch struct {
 
 // Metric defines a simplified Cloudwatch metric.
 type Metric struct {
-	StatisticExclude *[]string    `toml:"statistic_exclude"`
-	StatisticInclude *[]string    `toml:"statistic_include"`
-	MetricNames      []string     `toml:"names"`
-	Dimensions       []*Dimension `toml:"dimensions"`
+	StatisticExclude         *[]string    `toml:"statistic_exclude"`
+	StatisticInclude         *[]string    `toml:"statistic_include"`
+	ExtendedStatisticInclude *[]string    `toml:"extended_statistic_include"`
+	MetricNames              []string     `toml:"names"`
+	Dimensions               []*Dimension `toml:"dimensions"`
 }
 
 // Dimension defines a simplified Cloudwatch dimension (provides metric filtering).
@@ -83,17 +84,25 @@ type Dimension struct {
 	valueMatcher filter.Filter
 }
 
+type GetMetricStatisticsWrapper struct {
+	dimensions *map[string]string
+	input      *cwClient.GetMetricStatisticsInput
+	output     *cwClient.GetMetricStatisticsOutput
+}
+
 // metricCache caches metrics, their filters, and generated queries.
 type metricCache struct {
-	ttl     time.Duration
-	built   time.Time
-	metrics []filteredMetric
-	queries map[string][]types.MetricDataQuery
+	ttl           time.Duration
+	built         time.Time
+	metrics       []filteredMetric
+	queries       map[string][]types.MetricDataQuery
+	exStatsInputs map[string][]GetMetricStatisticsWrapper
 }
 
 type cloudwatchClient interface {
 	ListMetrics(context.Context, *cwClient.ListMetricsInput, ...func(*cwClient.Options)) (*cwClient.ListMetricsOutput, error)
 	GetMetricData(context.Context, *cwClient.GetMetricDataInput, ...func(*cwClient.Options)) (*cwClient.GetMetricDataOutput, error)
+	GetMetricStatistics(context.Context, *cwClient.GetMetricStatisticsInput, ...func(*cwClient.Options)) (*cwClient.GetMetricStatisticsOutput, error)
 }
 
 func (*CloudWatch) SampleConfig() string {
@@ -130,8 +139,9 @@ func (c *CloudWatch) Gather(acc telegraf.Accumulator) error {
 	c.updateWindow(time.Now())
 
 	// Get all of the possible queries so we can send groups of 100.
-	queries := c.getDataQueries(filteredMetrics)
-	if len(queries) == 0 {
+	queries, extendedStatsInputs := c.getDataQueries(filteredMetrics)
+
+	if len(queries) == 0 && len(extendedStatsInputs) == 0 {
 		return nil
 	}
 
@@ -141,9 +151,12 @@ func (c *CloudWatch) Gather(acc telegraf.Accumulator) error {
 	lmtr := limiter.NewRateLimiter(c.RateLimit, time.Second)
 	defer lmtr.Stop()
 	wg := sync.WaitGroup{}
-	rLock := sync.Mutex{}
 
+	rLock := sync.Mutex{}
 	results := map[string][]types.MetricDataResult{}
+
+	erLock := sync.Mutex{}
+	exStatResults := map[string][]GetMetricStatisticsWrapper{}
 
 	for namespace, namespacedQueries := range queries {
 		// 500 is the maximum number of metric data queries a `GetMetricData` request can contain.
@@ -173,9 +186,28 @@ func (c *CloudWatch) Gather(acc telegraf.Accumulator) error {
 		}
 	}
 
+	for namespace, extendedStatsInputs := range extendedStatsInputs {
+		for _, extendedStatsInput := range extendedStatsInputs {
+			wg.Add(1)
+			<-lmtr.C
+			go func(n string, inm GetMetricStatisticsWrapper) {
+				defer wg.Done()
+				resp, err := c.client.GetMetricStatistics(context.Background(), inm.input)
+				if err != nil {
+					acc.AddError(err)
+					return
+				}
+				erLock.Lock()
+				inm.output = resp
+				exStatResults[n] = append(exStatResults[n], inm)
+				erLock.Unlock()
+			}(namespace, extendedStatsInput)
+		}
+	}
+
 	wg.Wait()
 
-	return c.aggregateMetrics(acc, results)
+	return c.aggregateMetrics(acc, results, exStatResults)
 }
 
 func (c *CloudWatch) initializeCloudWatch() error {
@@ -226,8 +258,9 @@ func (c *CloudWatch) initializeCloudWatch() error {
 }
 
 type filteredMetric struct {
-	metrics    []types.Metric
-	statFilter filter.Filter
+	metrics       []types.Metric
+	statFilter    filter.Filter
+	extendedStats []string
 }
 
 // getFilteredMetrics returns metrics specified in the config file or metrics listed from Cloudwatch.
@@ -290,9 +323,14 @@ func getFilteredMetrics(c *CloudWatch) ([]filteredMetric, error) {
 				return nil, err
 			}
 
+			if m.ExtendedStatisticInclude == nil {
+				m.ExtendedStatisticInclude = &[]string{}
+			}
+
 			fMetrics = append(fMetrics, filteredMetric{
-				metrics:    metrics,
-				statFilter: statFilter,
+				metrics:       metrics,
+				statFilter:    statFilter,
+				extendedStats: *m.ExtendedStatisticInclude,
 			})
 		}
 	} else {
@@ -369,14 +407,17 @@ func (c *CloudWatch) updateWindow(relativeTo time.Time) {
 }
 
 // getDataQueries gets all of the possible queries so we can maximize the request payload.
-func (c *CloudWatch) getDataQueries(filteredMetrics []filteredMetric) map[string][]types.MetricDataQuery {
-	if c.metricCache != nil && c.metricCache.queries != nil && c.metricCache.isValid() {
-		return c.metricCache.queries
+func (c *CloudWatch) getDataQueries(filteredMetrics []filteredMetric) (map[string][]types.MetricDataQuery, map[string][]GetMetricStatisticsWrapper) {
+
+	if c.metricCache != nil && (c.metricCache.queries != nil || c.metricCache.exStatsInputs != nil) && c.metricCache.isValid() {
+		return c.metricCache.queries, c.metricCache.exStatsInputs
 	}
 
 	c.queryDimensions = map[string]*map[string]string{}
 
 	dataQueries := map[string][]types.MetricDataQuery{}
+	exStatsInputs := map[string][]GetMetricStatisticsWrapper{}
+
 	for i, filtered := range filteredMetrics {
 		for j, metric := range filtered.metrics {
 			id := strconv.Itoa(j) + "_" + strconv.Itoa(i)
@@ -441,25 +482,40 @@ func (c *CloudWatch) getDataQueries(filteredMetrics []filteredMetric) map[string
 					},
 				})
 			}
+			if filtered.extendedStats != nil {
+				exStatsInputs[*metric.Namespace] = append(exStatsInputs[*metric.Namespace], GetMetricStatisticsWrapper{
+					dimensions: dimension,
+					input: &cwClient.GetMetricStatisticsInput{
+						StartTime:          aws.Time(c.windowStart),
+						EndTime:            aws.Time(c.windowEnd),
+						Dimensions:         metric.Dimensions,
+						MetricName:         metric.MetricName,
+						Namespace:          metric.Namespace,
+						Period:             aws.Int32(int32(time.Duration(c.Period).Seconds())),
+						ExtendedStatistics: filtered.extendedStats,
+					},
+				})
+			}
 		}
 	}
 
-	if len(dataQueries) == 0 {
+	if len(dataQueries) == 0 && len(exStatsInputs) == 0 {
 		c.Log.Debug("no metrics found to collect")
-		return nil
+		return nil, nil
 	}
 
 	if c.metricCache == nil {
 		c.metricCache = &metricCache{
-			queries: dataQueries,
-			built:   time.Now(),
-			ttl:     time.Duration(c.CacheTTL),
+			queries:       dataQueries,
+			exStatsInputs: exStatsInputs,
+			built:         time.Now(),
+			ttl:           time.Duration(c.CacheTTL),
 		}
 	} else {
 		c.metricCache.queries = dataQueries
 	}
 
-	return dataQueries
+	return dataQueries, exStatsInputs
 }
 
 // gatherMetrics gets metric data from Cloudwatch.
@@ -487,6 +543,7 @@ func (c *CloudWatch) gatherMetrics(
 func (c *CloudWatch) aggregateMetrics(
 	acc telegraf.Accumulator,
 	metricDataResults map[string][]types.MetricDataResult,
+	exStatResults map[string][]GetMetricStatisticsWrapper,
 ) error {
 	var (
 		grouper = internalMetric.NewSeriesGrouper()
@@ -508,6 +565,27 @@ func (c *CloudWatch) aggregateMetrics(
 					acc.AddError(err)
 				}
 			}
+		}
+	}
+
+	for namespace, results := range exStatResults {
+		namespace = sanitizeMeasurement(namespace)
+
+		for _, result := range results {
+
+			tags := *result.dimensions
+			tags["region"] = c.Region
+
+			for _, datapoint := range result.output.Datapoints {
+
+				for stat, value := range datapoint.ExtendedStatistics {
+					field_name := snakeCase(*result.output.Label + "_" + stat)
+					if err := grouper.Add(namespace, tags, *datapoint.Timestamp, field_name, value); err != nil {
+						acc.AddError(err)
+					}
+				}
+			}
+
 		}
 	}
 
@@ -542,6 +620,7 @@ func sanitizeMeasurement(namespace string) string {
 func snakeCase(s string) string {
 	s = internal.SnakeCase(s)
 	s = strings.ReplaceAll(s, " ", "_")
+	s = strings.ReplaceAll(s, ".", "_")
 	s = strings.ReplaceAll(s, "__", "_")
 	return s
 }

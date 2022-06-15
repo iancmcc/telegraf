@@ -20,6 +20,11 @@ import (
 
 type mockGatherCloudWatchClient struct{}
 
+func (m *mockGatherCloudWatchClient) GetMetricStatistics(_ context.Context, params *cwClient.GetMetricStatisticsInput, _ ...func(*cwClient.Options)) (*cwClient.GetMetricStatisticsOutput, error) {
+	result := &cwClient.GetMetricStatisticsOutput{}
+	return result, nil
+}
+
 func (m *mockGatherCloudWatchClient) ListMetrics(_ context.Context, params *cwClient.ListMetricsInput, _ ...func(*cwClient.Options)) (*cwClient.ListMetricsOutput, error) {
 	return &cwClient.ListMetricsOutput{
 		Metrics: []types.Metric{
@@ -150,6 +155,11 @@ func TestGather_MultipleNamespaces(t *testing.T) {
 
 type mockSelectMetricsCloudWatchClient struct{}
 
+func (m *mockSelectMetricsCloudWatchClient) GetMetricStatistics(_ context.Context, params *cwClient.GetMetricStatisticsInput, _ ...func(*cwClient.Options)) (*cwClient.GetMetricStatisticsOutput, error) {
+	result := &cwClient.GetMetricStatisticsOutput{}
+	return result, nil
+}
+
 func (m *mockSelectMetricsCloudWatchClient) ListMetrics(_ context.Context, params *cwClient.ListMetricsInput, _ ...func(*cwClient.Options)) (*cwClient.ListMetricsOutput, error) {
 	metrics := []types.Metric{}
 	// 4 metrics are available
@@ -266,7 +276,7 @@ func TestGenerateStatisticsInputParams(t *testing.T) {
 	c.updateWindow(now)
 
 	statFilter, _ := filter.NewIncludeExcludeFilter(nil, nil)
-	queries := c.getDataQueries([]filteredMetric{{metrics: []types.Metric{m}, statFilter: statFilter}})
+	queries, _ := c.getDataQueries([]filteredMetric{{metrics: []types.Metric{m}, statFilter: statFilter}})
 	params := c.getDataInputs(queries[namespace])
 
 	require.EqualValues(t, *params.EndTime, now.Add(-time.Duration(c.Delay)))
@@ -305,7 +315,7 @@ func TestGenerateStatisticsInputParamsFiltered(t *testing.T) {
 	c.updateWindow(now)
 
 	statFilter, _ := filter.NewIncludeExcludeFilter([]string{"average", "sample_count"}, nil)
-	queries := c.getDataQueries([]filteredMetric{{metrics: []types.Metric{m}, statFilter: statFilter}})
+	queries, _ := c.getDataQueries([]filteredMetric{{metrics: []types.Metric{m}, statFilter: statFilter}})
 	params := c.getDataInputs(queries[namespace])
 
 	require.EqualValues(t, *params.EndTime, now.Add(-time.Duration(c.Delay)))
