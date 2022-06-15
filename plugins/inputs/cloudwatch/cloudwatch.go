@@ -482,7 +482,7 @@ func (c *CloudWatch) getDataQueries(filteredMetrics []filteredMetric) (map[strin
 					},
 				})
 			}
-			if filtered.extendedStats != nil {
+			if filtered.extendedStats != nil && len(filtered.extendedStats) > 0 {
 				exStatsInputs[*metric.Namespace] = append(exStatsInputs[*metric.Namespace], GetMetricStatisticsWrapper{
 					dimensions: dimension,
 					input: &cwClient.GetMetricStatisticsInput{
