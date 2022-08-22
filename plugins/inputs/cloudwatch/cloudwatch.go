@@ -513,6 +513,7 @@ func (c *CloudWatch) getDataQueries(filteredMetrics []filteredMetric) (map[strin
 		}
 	} else {
 		c.metricCache.queries = dataQueries
+		c.metricCache.exStatsInputs = exStatsInputs
 	}
 
 	return dataQueries, exStatsInputs
