@@ -192,7 +192,7 @@ func (c *CloudWatch) Gather(acc telegraf.Accumulator) error {
 			<-lmtr.C
 			go func(n string, inm GetMetricStatisticsWrapper) {
 				defer wg.Done()
-				resp, err := c.client.GetMetricStatistics(context.Background(), inm.input)
+				resp, err := c.client.GetMetricStatistics(context.Background(), c.getExtendedStatisticsInputs(inm))
 				if err != nil {
 					acc.AddError(err)
 					return
@@ -486,8 +486,6 @@ func (c *CloudWatch) getDataQueries(filteredMetrics []filteredMetric) (map[strin
 				exStatsInputs[*metric.Namespace] = append(exStatsInputs[*metric.Namespace], GetMetricStatisticsWrapper{
 					dimensions: dimension,
 					input: &cwClient.GetMetricStatisticsInput{
-						StartTime:          aws.Time(c.windowStart),
-						EndTime:            aws.Time(c.windowEnd),
 						Dimensions:         metric.Dimensions,
 						MetricName:         metric.MetricName,
 						Namespace:          metric.Namespace,
@@ -641,6 +639,13 @@ func (c *CloudWatch) getDataInputs(dataQueries []types.MetricDataQuery) *cwClien
 		EndTime:           aws.Time(c.windowEnd),
 		MetricDataQueries: dataQueries,
 	}
+}
+
+func (c *CloudWatch) getExtendedStatisticsInputs(inm GetMetricStatisticsWrapper) *cwClient.GetMetricStatisticsInput {
+	input := inm.input
+	input.StartTime = aws.Time(c.windowStart)
+	input.EndTime = aws.Time(c.windowEnd)
+	return input
 }
 
 // isValid checks the validity of the metric cache.
